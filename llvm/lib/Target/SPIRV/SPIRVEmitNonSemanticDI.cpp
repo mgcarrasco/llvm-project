@@ -157,6 +157,13 @@ private:
   Register emitDebugSource(StringRef FilePath, StringRef FileContents,
                            SPIRVCodeGenContext &Ctx);
 
+  Register emitDebugSourceForFile(const DIFile *File, SPIRVCodeGenContext &Ctx);
+
+  Register emitDebugCompilationUnitForFile(
+      const DIFile *File, Register DebugSourceReg, int64_t Language,
+      SPIRVCodeGenContext &Ctx, Register DebugInfoVersionReg,
+      Register DwarfVersionReg, const DICompileUnit *CUNode);
+
   void extractTypeMetadata(DIType *Ty, DebugInfoCollector &Collector);
 
   void handleCompositeType(DICompositeType *CT, DebugInfoCollector &Collector);
@@ -221,6 +228,9 @@ private:
   Register findBaseTypeRegisterRecursive(const DIType *Ty,
                                          SPIRVCodeGenContext &Ctx,
                                          bool &IsForwardRef);
+
+  void emitSubprogramFiles(const SmallPtrSet<DISubprogram *, 12> &SubPrograms,
+                           SPIRVCodeGenContext &Ctx);
 
   void emitSubprograms(const SmallPtrSet<DISubprogram *, 12> &SubPrograms,
                        SPIRVCodeGenContext &Ctx);
@@ -543,6 +553,7 @@ bool SPIRVEmitNonSemanticDI::emitGlobalDI(MachineFunction &MF,
     emitAllTemplateDebugInstructions(Collector.CompositeTypesWithTemplates,
                                      Ctx);
     emitSubroutineTypes(Collector.SubRoutineTypes, Ctx);
+    emitSubprogramFiles(Collector.SubPrograms, Ctx);
     emitSubprograms(Collector.SubPrograms, Ctx);
     emitLexicalScopes(Collector.LexicalScopes, Ctx);
     emitDebugTypePtrToMember(Collector.PtrToMemberTypes, Ctx);
@@ -822,21 +833,12 @@ void SPIRVEmitNonSemanticDI::emitDebugTypeEnum(
   }
 }
 
-void SPIRVEmitNonSemanticDI::emitSingleCompilationUnit(
-    StringRef FilePath, int64_t Language, SPIRVCodeGenContext &Ctx,
-    Register DebugInfoVersionReg, Register DwarfVersionReg,
-    Register &DebugSourceResIdReg, Register &DebugCompUnitResIdReg,
-    const DIFile *FileMDNode, const DICompileUnit *CUNode) {
-
-  std::string FileMDContents;
-  if (FileMDNode && FileMDNode->getRawFile() &&
-      FileMDNode->getSource().has_value())
-    FileMDContents = FileMDNode->getSource().value().str();
-
-  DebugSourceResIdReg = emitDebugSource(FilePath, FileMDContents, Ctx);
-  Ctx.SourceRegPairs.emplace_back(FileMDNode, DebugSourceResIdReg);
-
-  SourceLanguage SpirvSourceLanguage = SourceLanguage::Unknown;
+Register SPIRVEmitNonSemanticDI::emitDebugCompilationUnitForFile(
+    const DIFile *File, Register DebugSourceReg, int64_t Language,
+    SPIRVCodeGenContext &Ctx, Register DebugInfoVersionReg,
+    Register DwarfVersionReg, const DICompileUnit *CUNode) {
+  // Map DWARF source language to SPIR-V SourceLanguage
+  auto SpirvSourceLanguage = SourceLanguage::Unknown;
   switch (Language) {
   case dwarf::DW_LANG_OpenCL:
     SpirvSourceLanguage = SourceLanguage::OpenCL_C;
@@ -870,14 +872,35 @@ void SPIRVEmitNonSemanticDI::emitSingleCompilationUnit(
   const Register SourceLanguageReg = Ctx.GR->buildConstantInt(
       SpirvSourceLanguage, Ctx.MIRBuilder, Ctx.I32Ty, false);
 
-  DebugCompUnitResIdReg =
-      EmitDIInstruction(SPIRV::NonSemanticExtInst::DebugCompilationUnit,
-                        {DebugInfoVersionReg, DwarfVersionReg,
-                         DebugSourceResIdReg, SourceLanguageReg},
-                        Ctx, false);
+  Register DebugCompUnitReg = EmitDIInstruction(
+      SPIRV::NonSemanticExtInst::DebugCompilationUnit,
+      {DebugInfoVersionReg, DwarfVersionReg, DebugSourceReg, SourceLanguageReg},
+      Ctx, false);
+
   if (CUNode)
-    Ctx.GR->addDebugValue(CUNode, DebugCompUnitResIdReg);
-  Ctx.CompileUnitRegPairs.emplace_back(FileMDNode, DebugCompUnitResIdReg);
+    Ctx.GR->addDebugValue(CUNode, DebugCompUnitReg);
+  Ctx.CompileUnitRegPairs.emplace_back(File, DebugCompUnitReg);
+
+  return DebugCompUnitReg;
+}
+
+void SPIRVEmitNonSemanticDI::emitSingleCompilationUnit(
+    StringRef FilePath, int64_t Language, SPIRVCodeGenContext &Ctx,
+    Register DebugInfoVersionReg, Register DwarfVersionReg,
+    Register &DebugSourceResIdReg, Register &DebugCompUnitResIdReg,
+    const DIFile *FileMDNode, const DICompileUnit *CUNode) {
+
+  std::string FileMDContents;
+  if (FileMDNode && FileMDNode->getRawFile() &&
+      FileMDNode->getSource().has_value())
+    FileMDContents = FileMDNode->getSource().value().str();
+
+  DebugSourceResIdReg = emitDebugSource(FilePath, FileMDContents, Ctx);
+  Ctx.SourceRegPairs.emplace_back(FileMDNode, DebugSourceResIdReg);
+
+  DebugCompUnitResIdReg = emitDebugCompilationUnitForFile(
+      FileMDNode, DebugSourceResIdReg, Language, Ctx, DebugInfoVersionReg,
+      DwarfVersionReg, CUNode);
 }
 
 Register SPIRVEmitNonSemanticDI::findEmittedBasicTypeReg(
@@ -1162,6 +1185,41 @@ void SPIRVEmitNonSemanticDI::emitSubroutineTypes(
   }
 }
 
+void SPIRVEmitNonSemanticDI::emitSubprogramFiles(
+    const SmallPtrSet<DISubprogram *, 12> &SubPrograms,
+    SPIRVCodeGenContext &Ctx) {
+  // Emit DebugSource for any files referenced by subprograms that weren't
+  // already emitted as part of compilation units.
+  //
+  // This handles the case where a subprogram is defined in a different file
+  // than the compilation unit's primary file. For example:
+  //   - Compilation Unit: foo.cpp
+  //   - Subprogram: __assertfail() defined in hip_assert.h (included header)
+  //
+  // Only the compilation unit files are emitted in emitSingleCompilationUnit(),
+  // so we need to emit DebugSource for any additional files referenced by
+  // subprograms before processing the subprograms themselves.
+  for (const auto *SubProgram : SubPrograms) {
+    const DIFile *File = SubProgram->getFile();
+    if (!File)
+      continue;
+
+    // Check if this file already has a DebugSource
+    bool AlreadyEmitted = false;
+    for (const auto &Pair : Ctx.SourceRegPairs) {
+      if (Pair.first == File) {
+        AlreadyEmitted = true;
+        break;
+      }
+    }
+
+    // Emit DebugSource for this file if it's missing
+    if (!AlreadyEmitted) {
+      emitDebugSourceForFile(File, Ctx);
+    }
+  }
+}
+
 void SPIRVEmitNonSemanticDI::emitSubprograms(
     const SmallPtrSet<DISubprogram *, 12> &SubPrograms,
     SPIRVCodeGenContext &Ctx) {
@@ -1178,8 +1236,8 @@ void SPIRVEmitNonSemanticDI::emitSubprograms(
         SubProgram->getLine(), Ctx.MIRBuilder, Ctx.I32Ty, false, false));
     Operands.push_back(
         Ctx.GR->buildConstantInt(1, Ctx.MIRBuilder, Ctx.I32Ty, false, false));
-    Register CUReg =
-        findRegisterFromMap(SubProgram->getFile(), Ctx.CompileUnitRegPairs);
+    // The handling for the Scope operand is not fully in sync with how the SPIRV-LLVM-Translator works.
+    Register CUReg = Ctx.GR->getDebugValue(SubProgram->getUnit());
     Operands.push_back(CUReg);
     Operands.push_back(EmitOpString(SubProgram->getLinkageName(), Ctx));
     Operands.push_back(Ctx.GR->buildConstantInt(
@@ -2088,6 +2146,19 @@ void SPIRVEmitNonSemanticDI::emitDebugLineAndScopeInstructions(
 }
 
 Register
+SPIRVEmitNonSemanticDI::emitDebugSourceForFile(const DIFile *File,
+                                               SPIRVCodeGenContext &Ctx) {
+  SmallString<128> FilePath;
+  sys::path::append(FilePath, File->getDirectory(), File->getFilename());
+  std::string FileMDContents;
+  if (File->getSource().has_value())
+    FileMDContents = File->getSource().value().str();
+  Register DebugSourceResIdReg = emitDebugSource(FilePath, FileMDContents, Ctx);
+  Ctx.SourceRegPairs.emplace_back(File, DebugSourceResIdReg);
+  return DebugSourceResIdReg;
+}
+
+Register
 SPIRVEmitNonSemanticDI::getOrCreateFileRegister(const DIFile *File,
                                                 SPIRVCodeGenContext &Ctx) {
   if (!File)
@@ -2111,13 +2182,7 @@ SPIRVEmitNonSemanticDI::getOrCreateFileRegister(const DIFile *File,
     }
     Ctx.MIRBuilder.setInsertPt(EntryMBB, It);
   }
-  SmallString<128> FilePath;
-  sys::path::append(FilePath, File->getDirectory(), File->getFilename());
-  std::string FileMDContents;
-  if (File->getSource().has_value())
-    FileMDContents = File->getSource().value().str();
-  Register DebugSourceResIdReg = emitDebugSource(FilePath, FileMDContents, Ctx);
-  Ctx.SourceRegPairs.emplace_back(File, DebugSourceResIdReg);
+  Register DebugSourceResIdReg = emitDebugSourceForFile(File, Ctx);
 
   if (CurrentPos != CurrentMBB.end()) {
     Ctx.MIRBuilder.setInsertPt(CurrentMBB, CurrentPos);
