@@ -2046,6 +2046,11 @@ SDValue AMDGPUTargetLowering::LowerDIVREM24(SDValue Op, SelectionDAG &DAG,
   if (Sign)
     ++DivBits;
 
+  // Match AMDGPUCodeGenPrepare::expandDivRem24, which rejects unsigned divides
+  // needing more than 23 bits due to v_rcp_f32 accuracy limits.
+  if (!Sign && DivBits > 23)
+    return SDValue();
+
   ISD::NodeType ToFp = Sign ? ISD::SINT_TO_FP : ISD::UINT_TO_FP;
   ISD::NodeType ToInt = Sign ? ISD::FP_TO_SINT : ISD::FP_TO_UINT;
 
